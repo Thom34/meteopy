@@ -15,7 +15,7 @@ import concurrent.futures
 import functools
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
-from typing import Optional
+from typing import Optional, List, NamedTuple
 
 import pandas as pd
 import numpy as np
@@ -32,7 +32,7 @@ from tqdm import tqdm
 # Configuration des logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Constantes globales
+# --- Constantes globales et objets ---
 VAR_LABELS_FR = {
     'TN': "Température minimale (°C)", 
     'TX': "Température maximale (°C)", 
@@ -49,6 +49,19 @@ DEFAULT_GRID_RESOLUTION = (150, 110)
 # Cache global pour éviter les rechargements
 _gdf_cache = None
 _dept_adjacency_cache = None
+
+# --- Définition d'un paramètre objet pour les données d'une station ---
+class StationData(NamedTuple):
+    lon: float
+    lat: float
+    name: str
+    val_main: float
+    val_ext: float
+    date_ext: str
+    coverage: float
+    dept: str
+    label_ext: str
+    aggregator: str
 
 # --- Fonctions de vérification et chargement géographique ---
 def check_critical_paths() -> bool:
@@ -69,7 +82,6 @@ def get_gdf_cached():
     if _gdf_cache is None:
         logging.info(f"Chargement du shapefile: {SHAPEFILE_PATH}")
         _gdf_cache = gpd.read_file(SHAPEFILE_PATH).to_crs("EPSG:4326")
-        # Correction des géométries invalides
         _gdf_cache["geometry"] = _gdf_cache["geometry"].buffer(0)
     return _gdf_cache
 
@@ -302,6 +314,7 @@ def compute_var_stats(var_code, daily_values):
 def collect_station_data(subset, var_code):
     """
     Extrait et regroupe les données par station depuis le DataFrame filtré.
+    Retourne un dictionnaire et un mapping des départements.
     """
     station_data = defaultdict(list)
     station_depts = {}
@@ -315,9 +328,9 @@ def collect_station_data(subset, var_code):
         station_depts[key] = extract_dept(row.get('NUM_POSTE', '??'))
     return station_data, station_depts
 
-def aggregate_period(df, start_date, end_date, var_code):
+def aggregate_period(df, start_date, end_date, var_code) -> List[StationData]:
     """
-    Agrège les données sur une période pour chaque station.
+    Agrège les données sur une période pour chaque station et retourne une liste de StationData.
     """
     if df.empty:
         return []
@@ -336,17 +349,17 @@ def aggregate_period(df, start_date, end_date, var_code):
     for station, values in station_data.items():
         coverage = (len(set(v[0] for v in values)) / total_days) * 100
         val_main, val_ext, date_ext, label_ext, aggregator = compute_var_stats(var_code, values)
-        results.append((
-            station[0],  # longitude
-            station[1],  # latitude
-            station[2],  # nom de la station
-            val_main,
-            val_ext,
-            date_ext,
-            coverage,
-            station_depts[station],
-            label_ext,
-            aggregator
+        results.append(StationData(
+            lon=station[0],
+            lat=station[1],
+            name=station[2],
+            val_main=val_main,
+            val_ext=val_ext,
+            date_ext=date_ext,
+            coverage=coverage,
+            dept=station_depts[station],
+            label_ext=label_ext,
+            aggregator=aggregator
         ))
     return results
 
@@ -499,8 +512,8 @@ def add_map_attribution(ax):
 def _group_stations(stations_data):
     """Groupe les données par station (clé : (NUM_POSTE, NOM_USUEL, DEPT))."""
     groups = defaultdict(list)
-    for key in stations_data:
-        groups[key].extend(stations_data[key])
+    for station in stations_data:
+        groups[(station.name, station.dept, station.lon, station.lat)].append(station)
     return groups
 
 def log_complete_station_stats(stations_data, total_days, var_code, depts_to_analyze):
@@ -508,65 +521,65 @@ def log_complete_station_stats(stations_data, total_days, var_code, depts_to_ana
     logging.info("===== DONNÉES COMPLÈTES (SANS FILTRES) =====")
     groups = _group_stations(stations_data)
     for dept in depts_to_analyze:
-        dept_stations = [key for key in groups if key[2] == dept]
+        dept_stations = [key for key in groups if key[1] == dept]
         if not dept_stations:
             logging.info(f"Département {dept}: Aucune station trouvée")
             continue
         logging.info(f"Département {dept}: {len(dept_stations)} stations")
-        for i, (sid, name, _) in enumerate(sorted(dept_stations)):
-            daily_values = groups[(sid, name, dept)]
-            coverage = (len({date for date, _ in daily_values}) / total_days) * 100
+        for i, (name, _, lon, lat) in enumerate(sorted(dept_stations)):
+            daily_values = groups[(name, dept, lon, lat)]
+            coverage = (len({s.date_ext for s in daily_values}) / total_days) * 100
             if var_code == 'RR':
-                total_val = sum(val for _, val in daily_values)
-                logging.info(f"{i+1}. {sid} - {name}: {total_val:.1f}mm (cumul), Couverture: {coverage:.1f}%")
+                total_val = sum(s.val_main for s in daily_values)
+                logging.info(f"{i+1}. {name}: {total_val:.1f}mm (cumul), Couverture: {coverage:.1f}%")
             elif var_code == 'TN':
-                min_val = min(val for _, val in daily_values)
-                mean_val = sum(val for _, val in daily_values) / len(daily_values)
-                logging.info(f"{i+1}. {sid} - {name}: {mean_val:.1f}°C (moy), {min_val:.1f}°C (min), Couverture: {coverage:.1f}%")
+                min_val = min(s.val_main for s in daily_values)
+                mean_val = sum(s.val_main for s in daily_values) / len(daily_values)
+                logging.info(f"{i+1}. {name}: {mean_val:.1f}°C (moy), {min_val:.1f}°C (min), Couverture: {coverage:.1f}%")
             elif var_code == 'TX':
-                max_val = max(val for _, val in daily_values)
-                mean_val = sum(val for _, val in daily_values) / len(daily_values)
-                logging.info(f"{i+1}. {sid} - {name}: {mean_val:.1f}°C (moy), {max_val:.1f}°C (max), Couverture: {coverage:.1f}%")
+                max_val = max(s.val_main for s in daily_values)
+                mean_val = sum(s.val_main for s in daily_values) / len(daily_values)
+                logging.info(f"{i+1}. {name}: {mean_val:.1f}°C (moy), {max_val:.1f}°C (max), Couverture: {coverage:.1f}%")
             else:
-                mean_val = sum(val for _, val in daily_values) / len(daily_values)
-                logging.info(f"{i+1}. {sid} - {name}: {mean_val:.1f} (moy), Couverture: {coverage:.1f}%")
+                mean_val = sum(s.val_main for s in daily_values) / len(daily_values)
+                logging.info(f"{i+1}. {name}: {mean_val:.1f} (moy), Couverture: {coverage:.1f}%")
 
 def log_filtered_station_stats(stations_data, total_days, var_code, depts_to_analyze):
     """Rapporte les statistiques filtrées (couverture ≥ 95% et pour RR, valeur ≥ 0.2mm)."""
     logging.info("===== DONNÉES FILTRÉES (COUVERTURE ≥ 95%, RR ≥ 0.2mm) =====")
     groups = _group_stations(stations_data)
     for dept in depts_to_analyze:
-        dept_stations = [key for key in groups if key[2] == dept]
+        dept_stations = [key for key in groups if key[1] == dept]
         if not dept_stations:
             continue
         filtered = []
-        for sid, name, dept_code in dept_stations:
-            daily_values = groups[(sid, name, dept_code)]
-            coverage = (len({d for d, _ in daily_values}) / total_days) * 100
+        for (name, dept_code, lon, lat) in dept_stations:
+            daily_values = groups[(name, dept_code, lon, lat)]
+            coverage = (len({s.date_ext for s in daily_values}) / total_days) * 100
             if var_code == 'RR':
-                total_val = sum(val for _, val in daily_values)
+                total_val = sum(s.val_main for s in daily_values)
                 if coverage >= 95.0 and total_val >= 0.2:
-                    filtered.append((sid, name, total_val, coverage))
+                    filtered.append((name, total_val, coverage))
             else:
                 if var_code == 'TN':
-                    value = min(val for _, val in daily_values)
+                    value = min(s.val_main for s in daily_values)
                 elif var_code == 'TX':
-                    value = max(val for _, val in daily_values)
+                    value = max(s.val_main for s in daily_values)
                 else:
-                    value = sum(val for _, val in daily_values) / len(daily_values)
+                    value = sum(s.val_main for s in daily_values) / len(daily_values)
                 if coverage >= 95.0:
-                    filtered.append((sid, name, value, coverage))
-        filtered.sort(key=lambda x: x[2], reverse=True)
+                    filtered.append((name, value, coverage))
+        filtered.sort(key=lambda x: x[1], reverse=True)
         logging.info(f"Département {dept}: {len(filtered)} stations après filtrage")
-        for i, (sid, name, value, coverage) in enumerate(filtered):
+        for i, (name, value, coverage) in enumerate(filtered):
             if var_code == 'RR':
-                logging.info(f"{i+1}. {sid} - {name}: {value:.1f}mm (cumul), Couverture: {coverage:.1f}%")
+                logging.info(f"{i+1}. {name}: {value:.1f}mm (cumul), Couverture: {coverage:.1f}%")
             elif var_code == 'TN':
-                logging.info(f"{i+1}. {sid} - {name}: {value:.1f}°C (min), Couverture: {coverage:.1f}%")
+                logging.info(f"{i+1}. {name}: {value:.1f}°C (min), Couverture: {coverage:.1f}%")
             elif var_code == 'TX':
-                logging.info(f"{i+1}. {sid} - {name}: {value:.1f}°C (max), Couverture: {coverage:.1f}%")
+                logging.info(f"{i+1}. {name}: {value:.1f}°C (max), Couverture: {coverage:.1f}%")
             else:
-                logging.info(f"{i+1}. {sid} - {name}: {value:.1f} (moy), Couverture: {coverage:.1f}%")
+                logging.info(f"{i+1}. {name}: {value:.1f} (moy), Couverture: {coverage:.1f}%")
 
 def analyze_data_details(df, var_code, start_date, end_date, dept_main=None):
     """
@@ -590,21 +603,15 @@ def analyze_data_details(df, var_code, start_date, end_date, dept_main=None):
         depts_to_analyze = sorted(df_period['DEPT'].unique())
     total_stations = df_period['NUM_POSTE'].nunique()
     logging.info(f"Analyse pour {var_code} du {start_date} au {end_date}: {total_stations} stations au total")
-    station_data, _ = collect_station_data(df_period, var_code)
+    station_data = aggregate_period(df_period, start_date, end_date, var_code)
     log_complete_station_stats(station_data, total_days, var_code, depts_to_analyze)
     log_filtered_station_stats(station_data, total_days, var_code, depts_to_analyze)
 
 # --- Fonctions d'affichage de la carte ---
-def _filter_station_data(stations_data, var_code, min_coverage):
+def _filter_station_data(stations_data: List[StationData], var_code, min_coverage):
     """Filtre les stations selon la couverture minimale et, pour RR, la valeur minimale."""
-    filtered = []
-    for s in stations_data:
-        if s[6] < min_coverage:
-            continue
-        if var_code == 'RR' and s[3] < 0.2:
-            continue
-        filtered.append((s[0], s[1], s[3]))
-    return filtered
+    return [(s.lon, s.lat, s.val_main) for s in stations_data
+            if s.coverage >= min_coverage and not (var_code == 'RR' and s.val_main < 0.2)]
 
 def _create_grid_and_levels(lons, lats, vals, interpolation_method, grid_resolution, var_code):
     """Crée la grille interpolée et détermine les niveaux pour le contourf."""
@@ -631,7 +638,7 @@ def _create_grid_and_levels(lons, lats, vals, interpolation_method, grid_resolut
         levels = np.linspace(vmin, vmax, 50)
     return grid_x, grid_y, grid_z, levels
 
-def plot_map(ax, stations_data, var_code, start_date=None, end_date=None, 
+def plot_map(ax, stations_data: List[StationData], var_code, start_date=None, end_date=None, 
              dept_main=None, interpolation_method='linear',
              grid_resolution=DEFAULT_GRID_RESOLUTION, min_coverage=DEFAULT_MIN_COVERAGE, 
              allvaleurs=False, allname=False, mask_outside=False):
@@ -665,7 +672,7 @@ def plot_map(ax, stations_data, var_code, start_date=None, end_date=None,
     return contour
 
 # --- Annotation des stations sur la carte ---
-def add_station_annotations(ax, stations_data, var_code, dept_main=None, is_zoomed=False,
+def add_station_annotations(ax, stations_data: List[StationData], var_code, dept_main=None, is_zoomed=False,
                             min_coverage=DEFAULT_MIN_COVERAGE, allvaleurs=False, allname=False):
     """
     Ajoute les annotations des stations sur la carte.
@@ -680,34 +687,38 @@ def add_station_annotations(ax, stations_data, var_code, dept_main=None, is_zoom
     else:
         _add_general_annotations(ax, stations_data, dept_norm, is_zoomed, min_coverage)
 
-def _add_all_annotations(ax, stations_data, var_code, dept_norm, min_coverage, allname):
-    for lon, lat, name, val_main, _, _, coverage, dept, _, _ in stations_data:
-        if coverage < min_coverage:
+def _add_all_annotations(ax, stations_data: List[StationData], var_code, dept_norm, min_coverage, allname):
+    for station in stations_data:
+        if station.coverage < min_coverage:
             continue
-        if var_code == 'RR' and val_main < 0.2:
+        if var_code == 'RR' and station.val_main < 0.2:
             continue
-        if dept_norm and "FR" not in dept_norm and dept not in dept_norm:
+        if dept_norm and "FR" not in dept_norm and station.dept not in dept_norm:
             continue
-        ax.plot(lon, lat, marker='o', color='black', markersize=2,
+        ax.plot(station.lon, station.lat, marker='o', color='black', markersize=2,
                 transform=ccrs.PlateCarree(), zorder=100)
-        ax.text(lon, lat+0.01, f"{val_main:.1f}", transform=ccrs.PlateCarree(),
+        ax.text(station.lon, station.lat+0.01, f"{station.val_main:.1f}", transform=ccrs.PlateCarree(),
                 fontsize=7, color='red', ha='center', va='bottom', zorder=100,
                 bbox=dict(facecolor='white', alpha=0.7, pad=0.1, boxstyle='round'))
         if allname:
-            ax.text(lon, lat-0.01, name, transform=ccrs.PlateCarree(),
+            ax.text(station.lon, station.lat-0.01, station.name, transform=ccrs.PlateCarree(),
                     fontsize=5, color='black', ha='center', va='top', zorder=100)
 
-def _add_rr_annotations(ax, stations_data, dept_norm, is_zoomed, min_coverage):
+def _add_rr_annotations(ax, stations_data: List[StationData], dept_norm, is_zoomed, min_coverage):
+    """
+    Ajoute les annotations pour la variable RR en préservant l'objet station complet.
+    Seules les stations avec couverture >= min_coverage, val_main >= 0.2 et un agrégat "cumul" sont prises en compte.
+    """
     dept_max = {}
-    for lon, lat, _, val_main, _, _, coverage, dept, _, agg in stations_data:
-        if coverage < min_coverage or val_main < 0.2 or agg != "cumul":
+    for station in stations_data:
+        if station.coverage < min_coverage or station.val_main < 0.2 or station.aggregator != "cumul":
             continue
-        if dept_norm and "FR" not in dept_norm and dept not in dept_norm:
+        if dept_norm and "FR" not in dept_norm and station.dept not in dept_norm:
             continue
-        if dept not in dept_max or val_main > dept_max[dept]['val']:
-            dept_max[dept] = {'lon': lon, 'lat': lat, 'val': val_main}
-    annotations = sorted([ (data['lon'], data['lat'], data['val']) for data in dept_max.values() ],
-                         key=lambda x: x[2], reverse=True)
+        # Conserver l'objet entier pour comparer les valeurs
+        if station.dept not in dept_max or station.val_main > dept_max[station.dept].val_main:
+            dept_max[station.dept] = station
+    annotations = sorted([(s.lon, s.lat, s.val_main) for s in dept_max.values()], key=lambda x: x[2], reverse=True)
     threshold = 0.1 if is_zoomed else 0.2
     displayed = []
     guaranteed = annotations[:3] if is_zoomed else annotations[:1]
@@ -727,29 +738,29 @@ def _add_rr_annotations(ax, stations_data, dept_norm, is_zoomed, min_coverage):
                 ha='center', va='center', zorder=100,
                 bbox=dict(facecolor='white', alpha=0.7, edgecolor='red', boxstyle='round,pad=0.1'))
 
-def _add_general_annotations(ax, stations_data, dept_norm, is_zoomed, min_coverage):
+def _add_general_annotations(ax, stations_data: List[StationData], dept_norm, is_zoomed, min_coverage):
     filtered = []
-    for lon, lat, name, val_main, _, _, coverage, dept, _, _ in stations_data:
-        if coverage < min_coverage:
+    for station in stations_data:
+        if station.coverage < min_coverage:
             continue
-        if dept_norm and "FR" not in dept_norm and dept not in dept_norm:
+        if dept_norm and "FR" not in dept_norm and station.dept not in dept_norm:
             continue
-        filtered.append((lon, lat, name, val_main))
-    filtered.sort(key=lambda x: x[3], reverse=True)
+        filtered.append(station)
+    filtered.sort(key=lambda s: s.val_main, reverse=True)
     threshold = 0.1 if is_zoomed else 0.2
     max_labels = 50 if is_zoomed else 20
     displayed = []
-    for lon, lat, name, val in filtered[: (5 if is_zoomed else 2)]:
-        displayed.append((lon, lat))
-        ax.text(lon, lat, f"{val:.1f}", transform=ccrs.PlateCarree(),
+    for station in filtered[: (5 if is_zoomed else 2)]:
+        displayed.append((station.lon, station.lat))
+        ax.text(station.lon, station.lat, f"{station.val_main:.1f}", transform=ccrs.PlateCarree(),
                 fontsize=8, color='black', ha='center', va='center', zorder=11)
-    for lon, lat, name, val in filtered[(5 if is_zoomed else 2):]:
+    for station in filtered[(5 if is_zoomed else 2):]:
         if len(displayed) >= max_labels:
             break
-        if any(math.hypot(lon - dx, lat - dy) < threshold for dx, dy in displayed):
+        if any(math.hypot(station.lon - dx, station.lat - dy) < threshold for dx, dy in displayed):
             continue
-        displayed.append((lon, lat))
-        ax.text(lon, lat, f"{val:.1f}", transform=ccrs.PlateCarree(),
+        displayed.append((station.lon, station.lat))
+        ax.text(station.lon, station.lat, f"{station.val_main:.1f}", transform=ccrs.PlateCarree(),
                 fontsize=8, color='black', ha='center', va='center', zorder=11)
 
 # --- Génération des cartes ---
@@ -908,3 +919,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
