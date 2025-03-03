@@ -50,7 +50,7 @@ DEFAULT_GRID_RESOLUTION = (150, 110)
 _gdf_cache = None
 _dept_adjacency_cache = None
 
-# --- Fonctions de vérification et chargement des données géographiques ---
+# --- Fonctions de vérification et chargement géographique ---
 def check_critical_paths() -> bool:
     """Vérifie l'existence des chemins critiques pour le fonctionnement du script."""
     paths_to_check = {"Répertoire CSV": CSV_DIR, "Shapefile des départements": SHAPEFILE_PATH}
@@ -64,7 +64,7 @@ def check_critical_paths() -> bool:
     return all_ok
 
 def get_gdf_cached():
-    """Charge et met en cache le GeoDataFrame à partir du shapefile."""
+    """Charge et met en cache le GeoDataFrame du shapefile."""
     global _gdf_cache
     if _gdf_cache is None:
         logging.info(f"Chargement du shapefile: {SHAPEFILE_PATH}")
@@ -95,7 +95,7 @@ def build_dept_adjacency(shapefile_path=SHAPEFILE_PATH):
                         neighbors[dept1].add(dept2)
                         neighbors[dept2].add(dept1)
                 pbar.update(1)
-        logging.info(f"Adjacence des départements construite pour {len(neighbors)} départements")
+        logging.info(f"Adjacence construite pour {len(neighbors)} départements")
         _dept_adjacency_cache = neighbors
         return neighbors
     except Exception as e:
@@ -121,45 +121,54 @@ def find_neighbors_n_steps(neighbors_dict, start_depts, n_steps=1):
                     queue.append((neighbor, distance + 1))
     return visited
 
-# --- Fonctions de parsing et chargement des CSV ---
+# --- Gestion des dates ---
 def parse_date_range(date_str: str):
     """
     Analyse une chaîne de dates pour retourner un intervalle (start, end).
+    Accepte les formats complets (YYYYMMDD) ou mensuels (YYYYMM), avec ou sans plage.
     """
-    try:
-        if not date_str:
-            raise ValueError("Chaîne de date vide")
-        if '-' in date_str:
-            start_str, end_str = date_str.split('-')
-            if len(start_str) == 8 and len(end_str) == 8 and start_str.isdigit() and end_str.isdigit():
-                start = datetime.strptime(start_str, "%Y%m%d")
-                end = datetime.strptime(end_str, "%Y%m%d")
-            elif len(start_str) == 6 and len(end_str) == 6 and start_str.isdigit() and end_str.isdigit():
-                year1, month1 = int(start_str[:4]), int(start_str[4:6])
-                year2, month2 = int(end_str[:4]), int(end_str[4:6])
-                if not (1 <= month1 <= 12 and 1 <= month2 <= 12):
-                    raise ValueError(f"Mois invalide : {month1} ou {month2}")
-                start = datetime(year1, month1, 1)
-                end = datetime(year2, month2 + 1, 1) - timedelta(days=1) if month2 < 12 else datetime(year2 + 1, 1, 1) - timedelta(days=1)
-            else:
-                raise ValueError(f"Format de plage invalide : {date_str}")
-        elif len(date_str) == 8 and date_str.isdigit():
-            start = end = datetime.strptime(date_str, "%Y%m%d")
-        elif len(date_str) == 6 and date_str.isdigit():
-            year, month = int(date_str[:4]), int(date_str[4:6])
-            if not (1 <= month <= 12):
-                raise ValueError(f"Mois invalide : {month}")
-            start = datetime(year, month, 1)
-            end = datetime(year, month + 1, 1) - timedelta(days=1) if month < 12 else datetime(year + 1, 1, 1) - timedelta(days=1)
+    if not date_str:
+        raise ValueError("Chaîne de date vide")
+    
+    if '-' in date_str:
+        start_str, end_str = date_str.split('-')
+        start = _parse_date_string(start_str)
+        end = _parse_date_string(end_str, compute_end=(len(end_str)==6))
+    else:
+        if len(date_str) == 6:
+            start = _parse_date_string(date_str)
+            end = _compute_end_of_month(start)
+        elif len(date_str) == 8:
+            start = end = _parse_date_string(date_str)
         else:
             raise ValueError(f"Format de date invalide : {date_str}")
-        if start > end:
-            start, end = end, start
-            logging.warning("Dates inversées dans la plage, elles ont été réorganisées")
-        return start, end
-    except ValueError as e:
-        raise ValueError(f"Erreur dans le parsing de la date '{date_str}' : {e}")
+    
+    if start > end:
+        start, end = end, start
+        logging.warning("Dates inversées dans la plage, elles ont été réorganisées")
+    return start, end
 
+def _parse_date_string(ds: str, compute_end: bool = False) -> datetime:
+    """Parse une date sous format YYYYMMDD ou YYYYMM."""
+    if len(ds) == 8 and ds.isdigit():
+        return datetime.strptime(ds, "%Y%m%d")
+    elif len(ds) == 6 and ds.isdigit():
+        year, month = int(ds[:4]), int(ds[4:6])
+        if not (1 <= month <= 12):
+            raise ValueError(f"Mois invalide : {month}")
+        return datetime(year, month, 1)
+    else:
+        raise ValueError(f"Format de date invalide : {ds}")
+
+def _compute_end_of_month(start: datetime) -> datetime:
+    """Retourne le dernier jour du mois pour la date donnée."""
+    if start.month < 12:
+        next_month = datetime(start.year, start.month + 1, 1)
+    else:
+        next_month = datetime(start.year + 1, 1, 1)
+    return next_month - timedelta(days=1)
+
+# --- Chargement des CSV ---
 def get_csv_files(dept_codes, var_code, start_year, end_year, csv_dir=CSV_DIR):
     """
     Obtient la liste des fichiers CSV correspondant aux critères.
@@ -202,9 +211,9 @@ def read_csv_file(filepath, var_code):
         df['AAAAMMJJ'] = df['AAAAMMJJ'].astype(str).str.zfill(8)
         df[var_code] = pd.to_numeric(df[var_code], errors='coerce')
         if var_code in ['FXI', 'FXY', 'FFM']:
-            df[var_code] *= 3.6  # Conversion en km/h
+            df[var_code] *= 3.6
         elif var_code == 'INST':
-            df[var_code] /= 60.0  # Conversion en heures
+            df[var_code] /= 60.0
         return df
     except Exception as e:
         logging.warning(f"Impossible de lire {filepath} : {e}")
@@ -223,8 +232,8 @@ def load_csv_for_var(dept_codes, var_code, start_date, end_date, csv_dir=CSV_DIR
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         read_func = functools.partial(read_csv_file, var_code=var_code)
         future_to_file = {executor.submit(read_func, filepath): filepath for filepath in all_files}
-        for future in tqdm(concurrent.futures.as_completed(future_to_file), 
-                           total=len(all_files), 
+        for future in tqdm(concurrent.futures.as_completed(future_to_file),
+                           total=len(all_files),
                            desc=f"Lecture des fichiers CSV pour {var_code}",
                            unit="fichier"):
             filepath = future_to_file[future]
@@ -244,33 +253,27 @@ def load_csv_for_var(dept_codes, var_code, start_date, end_date, csv_dir=CSV_DIR
     logging.info(f"Données chargées pour {var_code}: {len(filtered_df)} lignes")
     return filtered_df
 
-# --- Fonctions de traitement des données ---
+# --- Traitement des données ---
 def extract_dept(station_id) -> str:
     """
     Extrait le code du département à partir d'un code de station météo.
+    Pour un code à 8 chiffres, on prend les deux premiers.
+    Pour un code à 7 chiffres commençant par 7, 8 ou 9, on préfixe d'un 0.
+    Sinon, on tente de retourner les 2 premiers caractères numériques.
     """
-    station_id = str(station_id)
-    if len(station_id) == 8:
-        return station_id[:2]
-    elif len(station_id) == 7:
-        if station_id.startswith(('7', '8', '9')) and '1' <= station_id[1] <= '9':
-            return '0' + station_id[1]
-    if station_id.startswith('01'): return '01'
-    elif station_id.startswith('02'): return '02'
-    elif station_id.startswith('03'): return '03'
-    elif station_id.startswith('04'): return '04'
-    elif station_id.startswith('05'): return '05'
-    elif station_id.startswith('06'): return '06'
-    elif station_id.startswith('07'): return '07'
-    elif station_id.startswith('08'): return '08'
-    elif station_id.startswith('09'): return '09'
-    if len(station_id) >= 2 and station_id[:2].isdigit():
-        return station_id[:2]
-    return '??'
+    sid = str(station_id)
+    if len(sid) == 8 and sid.isdigit():
+        return sid[:2]
+    if len(sid) == 7 and sid[0] in '789' and sid[1].isdigit():
+        return f"0{sid[1]}"
+    if len(sid) >= 2 and sid[:2].isdigit():
+        return sid[:2]
+    return "??"
 
 def compute_var_stats(var_code, daily_values):
     """
     Calcule les statistiques pour une variable.
+    Retourne (valeur principale, valeur extrême, date de l'extrême, libellé, type d'agrégation)
     """
     values = [v[1] for v in daily_values]
     if not values:
@@ -296,9 +299,9 @@ def compute_var_stats(var_code, daily_values):
         mean = sum(values) / len(values)
         return mean, extreme, find_date_of_value(extreme), "max", "moy"
 
-def collect_station_data(subset, var_code, total_days):
+def collect_station_data(subset, var_code):
     """
-    Extrait les données par station dans le DataFrame filtré.
+    Extrait et regroupe les données par station depuis le DataFrame filtré.
     """
     station_data = defaultdict(list)
     station_depts = {}
@@ -328,19 +331,19 @@ def aggregate_period(df, start_date, end_date, var_code):
     if not required_cols.issubset(subset.columns):
         logging.error(f"Colonnes requises manquantes : {required_cols - set(subset.columns)}")
         return []
-    station_data, station_depts = collect_station_data(subset, var_code, total_days)
+    station_data, station_depts = collect_station_data(subset, var_code)
     results = []
     for station, values in station_data.items():
         coverage = (len(set(v[0] for v in values)) / total_days) * 100
         val_main, val_ext, date_ext, label_ext, aggregator = compute_var_stats(var_code, values)
         results.append((
-            station[0],      # longitude
-            station[1],      # latitude
-            station[2],      # nom de la station
-            val_main,        # valeur principale
-            val_ext,         # valeur extrême
-            date_ext,        # date de l'extrême
-            coverage,        # couverture
+            station[0],  # longitude
+            station[1],  # latitude
+            station[2],  # nom de la station
+            val_main,
+            val_ext,
+            date_ext,
+            coverage,
             station_depts[station],
             label_ext,
             aggregator
@@ -438,7 +441,7 @@ def get_custom_colormap(var_code):
 
 def mask_grid_to_dept(grid_x, grid_y, grid_z, dept_code):
     """
-    Masque (met à NaN) les points en dehors du département.
+    Masque les points de la grille en dehors du département spécifié.
     """
     try:
         from shapely.geometry import Point
@@ -481,96 +484,10 @@ def add_base_map_features(ax, dept_main=None):
     ocean = cfeature.NaturalEarthFeature('physical', 'ocean', '10m')
     ax.add_geometries(ocean.geometries(), ccrs.PlateCarree(), facecolor='lightblue', edgecolor='none', zorder=10)
 
-def add_station_annotations(ax, stations_data, var_code, dept_main=None, is_zoomed=False, 
-                            min_coverage=DEFAULT_MIN_COVERAGE, allvaleurs=False, allname=False):
-    """
-    Ajoute les annotations de stations sur la carte.
-    """
-    var_code = var_code.upper()
-    dept_main_normalized = [d.zfill(2) for d in dept_main] if dept_main else []
-    if allvaleurs:
-        valid_stations = []
-        for lon, lat, name, val_main, _, _, coverage, dept, _, _ in stations_data:
-            if coverage < min_coverage:
-                continue
-            if var_code == 'RR' and val_main < 0.2:
-                continue
-            if dept_main_normalized and "FR" not in dept_main_normalized and dept not in dept_main_normalized:
-                continue
-            valid_stations.append((lon, lat, name, val_main))
-        for lon, lat, name, value in valid_stations:
-            ax.plot(lon, lat, marker='o', color='black', markersize=2, transform=ccrs.PlateCarree(), zorder=100)
-            ax.text(lon, lat+0.01, f"{value:.1f}", transform=ccrs.PlateCarree(),
-                    fontsize=7, color='red', ha='center', va='bottom', zorder=100,
-                    bbox=dict(facecolor='white', alpha=0.7, pad=0.1, boxstyle='round'))
-            if allname:
-                ax.text(lon, lat-0.01, name, transform=ccrs.PlateCarree(),
-                        fontsize=5, color='black', ha='center', va='top', zorder=100)
-        return
-
-    if var_code == 'RR':
-        dept_max = {}
-        for lon, lat, _, val_main, _, _, coverage, dept, _, agg in stations_data:
-            if coverage < min_coverage:
-                continue
-            if val_main < 0.2:
-                continue
-            if agg != "cumul":
-                continue
-            if dept_main_normalized and "FR" not in dept_main_normalized and dept not in dept_main_normalized:
-                continue
-            if dept not in dept_max or val_main > dept_max[dept]['val']:
-                dept_max[dept] = {'lon': lon, 'lat': lat, 'val': val_main}
-        annotations = sorted([(data['lon'], data['lat'], data['val']) for data in dept_max.values()], key=lambda x: x[2], reverse=True)
-        threshold = 0.1 if is_zoomed else 0.2
-        displayed = []
-        min_labels_to_show = 3 if is_zoomed else 1
-        guaranteed_labels = annotations[:min_labels_to_show]
-        other_labels = annotations[min_labels_to_show:]
-        for lon, lat, val in guaranteed_labels:
-            displayed.append((lon, lat, val))
-            ax.text(lon, lat, f"{val:.1f}", transform=ccrs.PlateCarree(), 
-                    fontsize=7 if is_zoomed else 6, fontweight='bold', color='red',
-                    ha='center', va='center', zorder=100, 
-                    bbox=dict(facecolor='white', alpha=0.7, edgecolor='red', boxstyle='round,pad=0.1'))
-        for lon, lat, val in other_labels:
-            if any(math.hypot(lon - d_lon, lat - d_lat) < threshold for d_lon, d_lat, _ in displayed):
-                continue
-            displayed.append((lon, lat, val))
-            ax.text(lon, lat, f"{val:.1f}", transform=ccrs.PlateCarree(), 
-                    fontsize=7 if is_zoomed else 6, fontweight='bold', color='red',
-                    ha='center', va='center', zorder=100, 
-                    bbox=dict(facecolor='white', alpha=0.7, edgecolor='red', boxstyle='round,pad=0.1'))
-    else:
-        filtered_stations = []
-        for lon, lat, name, val_main, _, _, coverage, dept, _, _ in stations_data:
-            if coverage < min_coverage:
-                continue
-            if dept_main_normalized and "FR" not in dept_main_normalized and dept not in dept_main_normalized:
-                continue
-            filtered_stations.append((lon, lat, name, val_main, dept))
-        filtered_stations.sort(key=lambda x: x[3], reverse=True)
-        threshold = 0.1 if is_zoomed else 0.2
-        max_labels = 50 if is_zoomed else 20
-        displayed = []
-        min_labels_to_show = 5 if is_zoomed else 2
-        guaranteed_labels = filtered_stations[:min_labels_to_show]
-        other_labels = filtered_stations[min_labels_to_show:]
-        for lon, lat, name, val, dept in guaranteed_labels:
-            displayed.append((lon, lat))
-            ax.text(lon, lat, f"{val:.1f}", transform=ccrs.PlateCarree(), 
-                    fontsize=8, color='black', ha='center', va='center', zorder=11)
-        for lon, lat, name, val, dept in other_labels:
-            if len(displayed) >= max_labels:
-                break
-            if any(math.hypot(lon - d_lon, lat - d_lat) < threshold for d_lon, d_lat in displayed):
-                continue
-            displayed.append((lon, lat))
-            ax.text(lon, lat, f"{val:.1f}", transform=ccrs.PlateCarree(), 
-                    fontsize=8, color='black', ha='center', va='center', zorder=11)
-
 def add_map_attribution(ax):
-    """Ajoute une attribution en bas de la carte."""
+    """
+    Ajoute une attribution en bas de la carte.
+    """
     ax.text(0.5, 0.01, 
             "Carte générée par https://www.meteociel.fr/ (données Meteo-France)",
             transform=ax.transAxes, ha='center', va='bottom', 
@@ -578,53 +495,58 @@ def add_map_attribution(ax):
             bbox=dict(facecolor='black', alpha=0.7), 
             zorder=9999, clip_on=False)
 
-# --- Fonctions pour le reporting détaillé ---
-def log_complete_station_stats(stations_data, total_days, var_code, depts_to_analyze):
-    logging.info("\n===== DONNÉES COMPLÈTES (SANS FILTRES) =====")
-    stations_group = defaultdict(list)
+# --- Reporting des statistiques par station ---
+def _group_stations(stations_data):
+    """Groupe les données par station (clé : (NUM_POSTE, NOM_USUEL, DEPT))."""
+    groups = defaultdict(list)
     for key in stations_data:
-        stations_group[key].extend(stations_data[key])
+        groups[key].extend(stations_data[key])
+    return groups
+
+def log_complete_station_stats(stations_data, total_days, var_code, depts_to_analyze):
+    """Rapporte les statistiques complètes pour chaque département."""
+    logging.info("===== DONNÉES COMPLÈTES (SANS FILTRES) =====")
+    groups = _group_stations(stations_data)
     for dept in depts_to_analyze:
-        dept_stations = [(sid, name, dept_code) for (sid, name, dept_code) in stations_group if dept_code == dept]
+        dept_stations = [key for key in groups if key[2] == dept]
         if not dept_stations:
             logging.info(f"Département {dept}: Aucune station trouvée")
             continue
-        logging.info(f"\nDépartement {dept}: {len(dept_stations)} stations")
-        for i, (station_id, name, _) in enumerate(sorted(dept_stations)):
-            daily_values = stations_group[(station_id, name, dept)]
-            coverage = (len(set(date for date, _ in daily_values)) / total_days) * 100
+        logging.info(f"Département {dept}: {len(dept_stations)} stations")
+        for i, (sid, name, _) in enumerate(sorted(dept_stations)):
+            daily_values = groups[(sid, name, dept)]
+            coverage = (len({date for date, _ in daily_values}) / total_days) * 100
             if var_code == 'RR':
-                total_value = sum(val for _, val in daily_values)
-                logging.info(f"{i+1}. {station_id} - {name}: {total_value:.1f}mm (cumul), Couverture: {coverage:.1f}%")
+                total_val = sum(val for _, val in daily_values)
+                logging.info(f"{i+1}. {sid} - {name}: {total_val:.1f}mm (cumul), Couverture: {coverage:.1f}%")
             elif var_code == 'TN':
-                min_value = min(val for _, val in daily_values)
-                mean_value = sum(val for _, val in daily_values) / len(daily_values)
-                logging.info(f"{i+1}. {station_id} - {name}: {mean_value:.1f}°C (moy), {min_value:.1f}°C (min), Couverture: {coverage:.1f}%")
+                min_val = min(val for _, val in daily_values)
+                mean_val = sum(val for _, val in daily_values) / len(daily_values)
+                logging.info(f"{i+1}. {sid} - {name}: {mean_val:.1f}°C (moy), {min_val:.1f}°C (min), Couverture: {coverage:.1f}%")
             elif var_code == 'TX':
-                max_value = max(val for _, val in daily_values)
-                mean_value = sum(val for _, val in daily_values) / len(daily_values)
-                logging.info(f"{i+1}. {station_id} - {name}: {mean_value:.1f}°C (moy), {max_value:.1f}°C (max), Couverture: {coverage:.1f}%")
+                max_val = max(val for _, val in daily_values)
+                mean_val = sum(val for _, val in daily_values) / len(daily_values)
+                logging.info(f"{i+1}. {sid} - {name}: {mean_val:.1f}°C (moy), {max_val:.1f}°C (max), Couverture: {coverage:.1f}%")
             else:
-                mean_value = sum(val for _, val in daily_values) / len(daily_values)
-                logging.info(f"{i+1}. {station_id} - {name}: {mean_value:.1f} (moy), Couverture: {coverage:.1f}%")
+                mean_val = sum(val for _, val in daily_values) / len(daily_values)
+                logging.info(f"{i+1}. {sid} - {name}: {mean_val:.1f} (moy), Couverture: {coverage:.1f}%")
 
 def log_filtered_station_stats(stations_data, total_days, var_code, depts_to_analyze):
-    logging.info("\n===== DONNÉES FILTRÉES (COUVERTURE ≥ 95%, RR ≥ 0.2mm) =====")
-    stations_group = defaultdict(list)
-    for key in stations_data:
-        stations_group[key].extend(stations_data[key])
+    """Rapporte les statistiques filtrées (couverture ≥ 95% et pour RR, valeur ≥ 0.2mm)."""
+    logging.info("===== DONNÉES FILTRÉES (COUVERTURE ≥ 95%, RR ≥ 0.2mm) =====")
+    groups = _group_stations(stations_data)
     for dept in depts_to_analyze:
-        dept_stations = [(sid, name, dept_code) for (sid, name, dept_code) in stations_group if dept_code == dept]
+        dept_stations = [key for key in groups if key[2] == dept]
         if not dept_stations:
             continue
-        filtered_stations = []
-        for station_id, name, _ in dept_stations:
-            daily_values = stations_group[(station_id, name, dept)]
-            coverage = (len(set(date for date, _ in daily_values)) / total_days) * 100
+        filtered = []
+        for sid, name, dept_code in dept_stations:
+            daily_values = groups[(sid, name, dept_code)]
+            coverage = (len({d for d, _ in daily_values}) / total_days) * 100
             if var_code == 'RR':
-                value = sum(val for _, val in daily_values)
-                if coverage >= 95.0 and value >= 0.2:
-                    filtered_stations.append((station_id, name, value, coverage))
+                total_val = sum(val for _, val in daily_values)
+                if coverage >= 95.0 and total_val >= 0.2:
+                    filtered.append((sid, name, total_val, coverage))
             else:
                 if var_code == 'TN':
                     value = min(val for _, val in daily_values)
@@ -633,18 +555,18 @@ def log_filtered_station_stats(stations_data, total_days, var_code, depts_to_ana
                 else:
                     value = sum(val for _, val in daily_values) / len(daily_values)
                 if coverage >= 95.0:
-                    filtered_stations.append((station_id, name, value, coverage))
-        filtered_stations.sort(key=lambda x: x[2], reverse=True)
-        logging.info(f"\nDépartement {dept}: {len(filtered_stations)} stations après filtrage")
-        for i, (station_id, name, value, coverage) in enumerate(filtered_stations):
+                    filtered.append((sid, name, value, coverage))
+        filtered.sort(key=lambda x: x[2], reverse=True)
+        logging.info(f"Département {dept}: {len(filtered)} stations après filtrage")
+        for i, (sid, name, value, coverage) in enumerate(filtered):
             if var_code == 'RR':
-                logging.info(f"{i+1}. {station_id} - {name}: {value:.1f}mm (cumul), Couverture: {coverage:.1f}%")
+                logging.info(f"{i+1}. {sid} - {name}: {value:.1f}mm (cumul), Couverture: {coverage:.1f}%")
             elif var_code == 'TN':
-                logging.info(f"{i+1}. {station_id} - {name}: {value:.1f}°C (min), Couverture: {coverage:.1f}%")
+                logging.info(f"{i+1}. {sid} - {name}: {value:.1f}°C (min), Couverture: {coverage:.1f}%")
             elif var_code == 'TX':
-                logging.info(f"{i+1}. {station_id} - {name}: {value:.1f}°C (max), Couverture: {coverage:.1f}%")
+                logging.info(f"{i+1}. {sid} - {name}: {value:.1f}°C (max), Couverture: {coverage:.1f}%")
             else:
-                logging.info(f"{i+1}. {station_id} - {name}: {value:.1f} (moy), Couverture: {coverage:.1f}%")
+                logging.info(f"{i+1}. {sid} - {name}: {value:.1f} (moy), Couverture: {coverage:.1f}%")
 
 def analyze_data_details(df, var_code, start_date, end_date, dept_main=None):
     """
@@ -668,13 +590,13 @@ def analyze_data_details(df, var_code, start_date, end_date, dept_main=None):
         depts_to_analyze = sorted(df_period['DEPT'].unique())
     total_stations = df_period['NUM_POSTE'].nunique()
     logging.info(f"Analyse pour {var_code} du {start_date} au {end_date}: {total_stations} stations au total")
-    station_data, _ = collect_station_data(df_period, var_code, total_days)
+    station_data, _ = collect_station_data(df_period, var_code)
     log_complete_station_stats(station_data, total_days, var_code, depts_to_analyze)
     log_filtered_station_stats(station_data, total_days, var_code, depts_to_analyze)
 
-# --- Fonctions pour l'affichage des cartes ---
+# --- Fonctions d'affichage de la carte ---
 def _filter_station_data(stations_data, var_code, min_coverage):
-    """Filtre les stations selon la couverture minimale et (pour RR) la valeur minimale."""
+    """Filtre les stations selon la couverture minimale et, pour RR, la valeur minimale."""
     filtered = []
     for s in stations_data:
         if s[6] < min_coverage:
@@ -685,7 +607,7 @@ def _filter_station_data(stations_data, var_code, min_coverage):
     return filtered
 
 def _create_grid_and_levels(lons, lats, vals, interpolation_method, grid_resolution, var_code):
-    """Crée la grille interpolée et calcule les niveaux pour contourf."""
+    """Crée la grille interpolée et détermine les niveaux pour le contourf."""
     if interpolation_method.lower() == 'idw':
         grid_x = np.linspace(-5, 10, grid_resolution[0])
         grid_y = np.linspace(41, 52, grid_resolution[1])
@@ -742,7 +664,95 @@ def plot_map(ax, stations_data, var_code, start_date=None, end_date=None,
     add_station_annotations(ax, stations_data, var_code, dept_main, is_zoomed, min_coverage, allvaleurs, allname)
     return contour
 
-# --- Fonctions de génération des cartes ---
+# --- Annotation des stations sur la carte ---
+def add_station_annotations(ax, stations_data, var_code, dept_main=None, is_zoomed=False,
+                            min_coverage=DEFAULT_MIN_COVERAGE, allvaleurs=False, allname=False):
+    """
+    Ajoute les annotations des stations sur la carte.
+    La logique est décomposée selon l'option allvaleurs et selon la variable.
+    """
+    var_code = var_code.upper()
+    dept_norm = [d.zfill(2) for d in dept_main] if dept_main else []
+    if allvaleurs:
+        _add_all_annotations(ax, stations_data, var_code, dept_norm, min_coverage, allname)
+    elif var_code == 'RR':
+        _add_rr_annotations(ax, stations_data, dept_norm, is_zoomed, min_coverage)
+    else:
+        _add_general_annotations(ax, stations_data, dept_norm, is_zoomed, min_coverage)
+
+def _add_all_annotations(ax, stations_data, var_code, dept_norm, min_coverage, allname):
+    for lon, lat, name, val_main, _, _, coverage, dept, _, _ in stations_data:
+        if coverage < min_coverage:
+            continue
+        if var_code == 'RR' and val_main < 0.2:
+            continue
+        if dept_norm and "FR" not in dept_norm and dept not in dept_norm:
+            continue
+        ax.plot(lon, lat, marker='o', color='black', markersize=2,
+                transform=ccrs.PlateCarree(), zorder=100)
+        ax.text(lon, lat+0.01, f"{val_main:.1f}", transform=ccrs.PlateCarree(),
+                fontsize=7, color='red', ha='center', va='bottom', zorder=100,
+                bbox=dict(facecolor='white', alpha=0.7, pad=0.1, boxstyle='round'))
+        if allname:
+            ax.text(lon, lat-0.01, name, transform=ccrs.PlateCarree(),
+                    fontsize=5, color='black', ha='center', va='top', zorder=100)
+
+def _add_rr_annotations(ax, stations_data, dept_norm, is_zoomed, min_coverage):
+    dept_max = {}
+    for lon, lat, _, val_main, _, _, coverage, dept, _, agg in stations_data:
+        if coverage < min_coverage or val_main < 0.2 or agg != "cumul":
+            continue
+        if dept_norm and "FR" not in dept_norm and dept not in dept_norm:
+            continue
+        if dept not in dept_max or val_main > dept_max[dept]['val']:
+            dept_max[dept] = {'lon': lon, 'lat': lat, 'val': val_main}
+    annotations = sorted([ (data['lon'], data['lat'], data['val']) for data in dept_max.values() ],
+                         key=lambda x: x[2], reverse=True)
+    threshold = 0.1 if is_zoomed else 0.2
+    displayed = []
+    guaranteed = annotations[:3] if is_zoomed else annotations[:1]
+    others = annotations[len(guaranteed):]
+    for lon, lat, val in guaranteed:
+        displayed.append((lon, lat, val))
+        ax.text(lon, lat, f"{val:.1f}", transform=ccrs.PlateCarree(),
+                fontsize=7 if is_zoomed else 6, fontweight='bold', color='red',
+                ha='center', va='center', zorder=100,
+                bbox=dict(facecolor='white', alpha=0.7, edgecolor='red', boxstyle='round,pad=0.1'))
+    for lon, lat, val in others:
+        if any(math.hypot(lon - dx, lat - dy) < threshold for dx, dy, _ in displayed):
+            continue
+        displayed.append((lon, lat, val))
+        ax.text(lon, lat, f"{val:.1f}", transform=ccrs.PlateCarree(),
+                fontsize=7 if is_zoomed else 6, fontweight='bold', color='red',
+                ha='center', va='center', zorder=100,
+                bbox=dict(facecolor='white', alpha=0.7, edgecolor='red', boxstyle='round,pad=0.1'))
+
+def _add_general_annotations(ax, stations_data, dept_norm, is_zoomed, min_coverage):
+    filtered = []
+    for lon, lat, name, val_main, _, _, coverage, dept, _, _ in stations_data:
+        if coverage < min_coverage:
+            continue
+        if dept_norm and "FR" not in dept_norm and dept not in dept_norm:
+            continue
+        filtered.append((lon, lat, name, val_main))
+    filtered.sort(key=lambda x: x[3], reverse=True)
+    threshold = 0.1 if is_zoomed else 0.2
+    max_labels = 50 if is_zoomed else 20
+    displayed = []
+    for lon, lat, name, val in filtered[: (5 if is_zoomed else 2)]:
+        displayed.append((lon, lat))
+        ax.text(lon, lat, f"{val:.1f}", transform=ccrs.PlateCarree(),
+                fontsize=8, color='black', ha='center', va='center', zorder=11)
+    for lon, lat, name, val in filtered[(5 if is_zoomed else 2):]:
+        if len(displayed) >= max_labels:
+            break
+        if any(math.hypot(lon - dx, lat - dy) < threshold for dx, dy in displayed):
+            continue
+        displayed.append((lon, lat))
+        ax.text(lon, lat, f"{val:.1f}", transform=ccrs.PlateCarree(),
+                fontsize=8, color='black', ha='center', va='center', zorder=11)
+
+# --- Génération des cartes ---
 def process_variable_map(var, dept_for_data, start_date, end_date, dept_main,
                          interpolation, grid_resolution, min_coverage, check_data,
                          allvaleurs, allname, mask_outside, ax):
